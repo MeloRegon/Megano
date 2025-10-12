@@ -22,22 +22,24 @@ class CartProductSerializer(serializers.ModelSerializer):
         fields = ['id', 'title', 'slug', 'price', 'images']
 
 # Позиция корзины
+from rest_framework import serializers
+
 class CartItemSerializer(serializers.ModelSerializer):
-    product = CartProductSerializer(read_only=True)
+    price_at_add = serializers.DecimalField(max_digits=10, decimal_places=2, coerce_to_string=False)
     total = serializers.SerializerMethodField()
 
     class Meta:
         model = CartItem
-        fields = ['id', 'qty', 'price_at_add', 'total', 'product']
+        fields = ('id', 'qty', 'price_at_add', 'total', 'product')
 
     def get_total(self, obj):
-        return obj.qty * obj.price_at_add
+        return float(obj.qty * obj.price_at_add)  # число, не строка
 
 # Вся корзина целиком
 class CartSerializer(serializers.Serializer):
     items = CartItemSerializer(many=True)
     total_qty = serializers.IntegerField()
-    total_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_amount = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=False)
 
 
 class OrderItemSerializer(serializers.ModelSerializer):

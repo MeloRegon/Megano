@@ -15,11 +15,14 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
+from django.contrib.staticfiles.urls import staticfiles_urlpatterns
 from django.urls import path, include
 from users.views import csrf
-from orders.views import CartView
 from django.conf import settings
 from django.conf.urls.static import static
+
+from orders.views import BasketView
+
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -29,7 +32,7 @@ urlpatterns = [
     path('api/', include('orders.urls')),
     path('api/csrf/', csrf),
     path('', include('frontend.urls')),
-
-    path('api/basket', CartView.as_view(), name='basket-alias'),
-] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-
+]
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += staticfiles_urlpatterns()

@@ -53,6 +53,11 @@ class Product(models.Model):
     purchases_count = models.PositiveIntegerField("Кол-во покупок", default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    count = models.PositiveIntegerField(verbose_name='Количество', default=0)
+    full_description = models.TextField(verbose_name='Полное описание', blank=True, default='')
+    free_delivery = models.BooleanField(verbose_name='Бесплатная доставка', default=False)
+    rating = models.DecimalField(max_digits=3, decimal_places=1, default=0)
+
     class Meta:
         verbose_name = 'Продукт'
         verbose_name_plural = "Продукт"
