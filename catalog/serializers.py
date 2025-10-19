@@ -125,7 +125,8 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ['id', 'name', 'slug', 'is_active', 'parent', 'image', 'subcategories']
+        fields = ['id', 'name', 'slug', 'is_active', 'parent', 'image', 'subcategories',]
+
 
     def get_image(self, obj):
         pic = getattr(obj, 'icon', None) or getattr(obj, 'image', None)

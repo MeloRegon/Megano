@@ -1,13 +1,18 @@
 # catalog/views.py
 
+import json
 from django.db.models import Q, Count, Min, Max, F, Prefetch
 from django.db.models.functions import Coalesce
 from django.templatetags.static import static
+from urllib.parse import urlparse, parse_qs
 
 from rest_framework.response import Response
 from rest_framework import permissions, generics
 from rest_framework.generics import ListAPIView, RetrieveAPIView, ListCreateAPIView
 from rest_framework.views import APIView
+from rest_framework.pagination import PageNumberPagination
+from math import ceil
+
 
 from .models import Product, Category, FeatureValue, Review, Tag
 from .serializers import (
@@ -39,13 +44,20 @@ class CategoryListView(ListAPIView):
             .order_by('id')
         )
 
-# --------- товары: список по Swagger (ProductShort) ---------
+class CatalogPagination(PageNumberPagination):
+    page_size_query_param = "limit"  # фронт передаёт параметр limit
+    page_query_param = "currentPage"  # фронт передаёт currentPage
+    page_size = 20  # значение по умолчанию
+
 class ProductListView(ListAPIView):
     """
-    GET /api/catalog/ — список товаров c фильтрами Swagger.
+    GET /api/catalog — список товаров с фильтрами и пагинацией по Swagger.
     """
     serializer_class = ProductShortSerializer
     permission_classes = [permissions.AllowAny]
+    pagination_class = CatalogPagination
+
+    import json
 
     def get_queryset(self):
         qs = (
@@ -58,46 +70,96 @@ class ProductListView(ListAPIView):
             )
         )
 
-        p = self.request.GET
+        params = self.request.GET.copy()
+        # Поддержка поиска по названию товара
+        search_name = (
+                params.get('filter[name]') or
+                params.get('filter') or
+                params.get('name')
+        )
 
-        # фильтры (Swagger формулировка)
-        cat = p.get("category")              # id категории (число)
-        name = p.get("name")                 # строка поиска по названию
-        min_price = p.get("minPrice")
-        max_price = p.get("maxPrice")
-        free_delivery = _parse_bool(p.get("freeDelivery"))
-        available = _parse_bool(p.get("available"))
+        if search_name:
+            print("SEARCH:", search_name)  # временно, чтобы убедиться
+            qs = qs.filter(title__icontains=search_name.strip())
+
+        # 🔹 Преобразуем filter[name], filter[minPrice] и т.д. в обычный словарь
+        filter_data = params.get('filter', {})
+        # поддержка поиска по названию ?filter=Asus
+        if isinstance(filter_data, str):
+            qs = qs.filter(title__icontains=filter_data)
+
+        for key, value in params.items():
+            if key.startswith("filter[") and key.endswith("]"):
+                field = key[len("filter["):-1]
+                filter_data[field] = value
+
+        # 🔹 Объединяем в один словарь для удобства
+        params.update(filter_data)
+
+        cat = params.get("category")
+        name = params.get("name")
+        min_price = params.get("minPrice")
+        max_price = params.get("maxPrice")
+        free_delivery = _parse_bool(params.get("freeDelivery"))
+        available = _parse_bool(params.get("available"))
 
         if cat:
             qs = qs.filter(category_id=cat)
-
         if name:
-            qs = qs.filter(Q(title__icontains=name))
-
+            qs = qs.filter(title__icontains=name)
         if min_price:
             qs = qs.filter(price__gte=min_price)
-
         if max_price:
             qs = qs.filter(price__lte=max_price)
-
-        if free_delivery is True:
+        if free_delivery:
             qs = qs.filter(free_delivery=True)
-        if available is True:
+        if available:
             qs = qs.filter(count__gt=0)
+            # поддержка поиска по полю title (?filter=MacBook)
+            search_text = params.get("filter")
+            if search_text:
+                qs = qs.filter(title__icontains=search_text)
 
-        # сортировка
-        ordering = p.get("ordering")
+        # 🔹 Сортировка
+        sort_field = params.get("sort", "date")
+        sort_type = params.get("sortType", "dec")
+
         mapping = {
-            "popularity": "-popularity",
+            "rating": "rating",
             "price": "price",
-            "-price": "-price",
-            "reviews": "-reviews_count",
-            "novelty": "-created_at",
+            "reviews": "reviews_count",
+            "date": "created_at",
         }
-        if ordering in mapping:
-            qs = qs.order_by(mapping[ordering], "-id")
+
+        if sort_field in mapping:
+            field = mapping[sort_field]
+            if sort_type == "dec":
+                field = f"-{field}"
+            qs = qs.order_by(field, "-id")
+
+        print("FILTER DATA:", filter_data)
+        print("FINAL PARAMS:", params)
+        print("RESULT COUNT:", qs.count())
+        print("ALL PRODUCTS COUNT:", Product.objects.count())
+        print("ACTIVE PRODUCTS COUNT:", Product.objects.filter(count__gt=0).count())
 
         return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        page = self.paginate_queryset(queryset)
+
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            pagination = self.paginator
+            return Response({
+                "items": serializer.data,
+                "currentPage": pagination.page.number,
+                "lastPage": pagination.page.paginator.num_pages,
+            })
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({"items": serializer.data})
 
 
 # --------- фильтры каталога (минимум бренды/цены) ---------
@@ -230,14 +292,19 @@ class BannersView(APIView):
 
         banners = []
         for i, cat in enumerate(categories):
+            # находим минимальную цену среди всех товаров в категории
+            products = Product.objects.filter(category=cat)
+            min_price = products.aggregate(Min("price"))["price__min"]
+
             img_path = static_imgs[i % len(static_imgs)]
             banners.append({
+                "id": cat.id,
                 "title": cat.name,
+                "price": min_price or 0,
                 "images": [{"src": static(img_path), "alt": cat.name}],
-                # отдай сразу всё, чтобы фронт не падал
-                "link": f"/catalog?category={cat.id}",  # на случай, если фронт ждёт готовый URL
-                "category": cat.id,                     # на случай, если склеивает /catalog/<id>/
-                "category_slug": getattr(cat, "slug", "") or "",  # на случай, если ждёт slug
+                "link": f"/catalog?category={cat.id}",
+                "category": cat.id,
+                "category_slug": getattr(cat, "slug", "") or "",
             })
 
         return Response(banners)

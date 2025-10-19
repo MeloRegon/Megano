@@ -1,3 +1,10 @@
+
+
+# ==============================
+# views.py — финальная версия под Swagger
+# ==============================
+
+import json
 from django.db.models import Sum, F
 from rest_framework import status, permissions
 from rest_framework.response import Response
@@ -6,167 +13,191 @@ from rest_framework.views import APIView
 from catalog.models import Product
 from .models import CartItem, Order, OrderItem
 from .serializers import (
-    CartSerializer,
-    CartItemSerializer,
     OrderCreateSerializer,
     OrderDetailSerializer,
-    OrderItemSerializer,
 )
 
 
+# ==============================
+# Вспомогательная функция для корзины
+# ==============================
 def get_cart_qs(request):
+    """
+    Возвращает QuerySet корзины для текущего пользователя или сессии.
+    """
     if request.user.is_authenticated:
-        return (CartItem.objects
-                .select_related('product', 'user')
-                .filter(user=request.user)
-                .order_by('-update_at'))
+        return (
+            CartItem.objects
+            .select_related('product', 'user')
+            .filter(user=request.user)
+            .order_by('-update_at')
+        )
 
     if not request.session.session_key:
         request.session.save()
     sk = request.session.session_key
 
-    return (CartItem.objects
-            .select_related('product')
-            .filter(session_key=sk)
-            .order_by('-update_at'))
+    return (
+        CartItem.objects
+        .select_related('product')
+        .filter(session_key=sk)
+        .order_by('-update_at')
+    )
 
 
-class CartView(APIView):
+# ==============================
+# /api/basket — основная корзина
+# ==============================
+class BasketView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        qs = get_cart_qs(request)
+        items = []
+        for ci in get_cart_qs(request):
+            p = ci.product
 
-        total_qty = qs.aggregate(total=Sum('qty'))['total'] or 0
-        total_amount = qs.aggregate(total=Sum(F('qty') * F('price_at_add')))['total'] or 0
+            # --- собираем изображения безопасно ---
+            images = []
+            try:
+                for img in p.images.all():
+                    src = getattr(img, "src", "")
+                    if hasattr(src, "url"):
+                        src = src.url
+                    alt = getattr(img, "alt", p.title)
+                    images.append({"src": src, "alt": alt})
+            except Exception:
+                    images = []
 
-        # сериализуем позиции корзины
-        items = CartItemSerializer(qs, many=True).data
+            # --- безопасно приводим цену и количество ---
+            price = getattr(p, "price", 0)
+            try:
+                price = float(price)
+            except Exception:
+                price = 0.0
 
-        # отдадим все популярные варианты ключей, чтобы фронт «попал» в нужный
-        payload = {
-            "items": items,
+            count = getattr(ci, "qty", 1)
+            try:
+                count = int(count)
+            except Exception:
+                count = 1
 
-            # количество
-            "total_qty": int(total_qty),
-            "totalQty": int(total_qty),
-            "count": int(total_qty),
+            items.append({
+                "id": int(p.id),
+                "category": getattr(p.category, "id", None),
+                "price": price,
+                "count": count,
+                "title": getattr(p, "title", ""),
+                "images": images,  # ✅ обязательно есть, даже если пустой
+            })
 
-            # сумма
-            "total_amount": float(total_amount),
-            "totalAmount": float(total_amount),
-            "total": float(total_amount),
-            "amount": float(total_amount),
-        }
-        return Response(payload)
+        return Response(items, status=200)
 
-
-class AddToCartView(APIView):
-    permission_classes = [permissions.AllowAny]
-
+    # POST /api/basket
     def post(self, request):
-        # принимаем и "product_id"/"qty", и "id"/"count" (как в swagger фронта)
-        product_id = request.data.get('product_id') or request.data.get('id')
-        qty_raw = request.data.get('qty', request.data.get('count', 1))
+        # фронт шлёт {"id": 123, "count": 2}
+        payload = request.data or {}
+        pid = payload.get("id")
+        cnt = payload.get("count", 1)
 
         try:
-            qty = int(qty_raw)
-        except (TypeError, ValueError):
-            return Response({'detail': 'qty/count must be integer'}, status=400)
-
-        if qty <= 0:
-            return Response({'detail': 'qty must be >= 1'}, status=400)
+            from catalog.models import Product
+            product = Product.objects.get(id=pid)
+        except Exception:
+            return Response({"detail": "Product not found"}, status=404)
 
         try:
-            product = Product.objects.get(id=product_id)
-        except Product.DoesNotExist:
-            return Response({'detail': 'Product not found'}, status=404)
+            cnt = int(cnt)
+        except Exception:
+            cnt = 1
+        if cnt < 1:
+            cnt = 1
 
-        qs = get_cart_qs(request)
+        from orders.models import CartItem  # путь по твоему проекту
+        defaults = {"price_at_add": getattr(product, "price", 0)}
 
-        defaults = {'price_at_add': product.price}
         if request.user.is_authenticated:
-            item, created = CartItem.objects.get_or_create(
+            obj, created = CartItem.objects.get_or_create(
                 user=request.user, product=product, defaults=defaults
             )
         else:
-            sk = request.session.session_key  # гарантирован в get_cart_qs
-            item, created = CartItem.objects.get_or_create(
+            if not request.session.session_key:
+                request.session.save()
+            sk = request.session.session_key
+            obj, created = CartItem.objects.get_or_create(
                 session_key=sk, product=product, defaults=defaults
             )
 
-        item.qty = (item.qty + qty) if not created else qty
-        item.save()
+        obj.qty = (obj.qty + cnt) if not created else cnt
+        obj.save()
 
-        return Response(CartItemSerializer(item).data, status=status.HTTP_201_CREATED)
+        # вернуть обновлённую корзину
+        return self.get(request)
 
+    # DELETE /api/basket
+    def delete(self, request):
+        # фронт шлёт {"id": 123, "count": 1}
+        payload = request.data or {}
+        pid = payload.get("id")
+        dec = payload.get("count", 1)
 
-class UpdateCartItemView(APIView):
-    permission_classes = [permissions.AllowAny]
-
-    def patch(self, request, pk):
-        qs = get_cart_qs(request)
         try:
-            item = qs.get(pk=pk)
-        except CartItem.DoesNotExist:
-            return Response({'detail': 'Item not found'}, status=404)
+            dec = int(dec)
+        except Exception:
+            dec = 1
+        if dec < 1:
+            dec = 1
 
-        qty = int(request.data.get('qty', item.qty))
-        if qty <= 0:
+        qs = get_cart_qs(request).filter(product_id=pid)
+        if not qs.exists():
+            return Response({"detail": "Item not found"}, status=404)
+
+        item = qs.first()
+        new_qty = int(getattr(item, "qty", 1)) - dec
+        if new_qty > 0:
+            item.qty = new_qty
+            item.save()
+        else:
             item.delete()
-            return Response(status=status.HTTP_204_NO_CONTENT)
 
-        item.qty = qty
-        item.save()
-        return Response(CartItemSerializer(item).data)
+        # вернуть обновлённую корзину
+        return self.get(request)
 
-
-class RemoveCartItemView(APIView):
-    permission_classes = [permissions.AllowAny]
-
-    def delete(self, request, pk):
-        qs = get_cart_qs(request)
-        deleted, _ = qs.filter(pk=pk).delete()
-        if not deleted:
-            return Response({'detail': 'Item not found'}, status=404)
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class ClearCartView(APIView):
-    permission_classes = [permissions.AllowAny]
-
-    def post(self, request):
-        qs = get_cart_qs(request)
-        qs.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
+# ==============================
+# /api/checkout — оформление заказа
+# ==============================
 class CheckoutView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        # 1) Корзина
+        """
+        Оформляет заказ из корзины.
+        """
         qs = get_cart_qs(request)
         if not qs.exists():
             return Response({'detail': 'Корзина пуста'}, status=400)
 
-        # 2) Данные от пользователя
+        # Данные из формы (учитываем «кривой» JSON)
+        if len(request.POST.keys()) == 1:
+            try:
+                only_key = next(iter(request.POST.keys()))
+                payload = json.loads(only_key)
+                request.data.update(payload)
+            except Exception:
+                pass
+
         ser = OrderCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
-        # 3) Итого по корзине
         agg = qs.aggregate(total=Sum(F('qty') * F('price_at_add')))
         total_amount = agg['total'] or 0
 
-        # 4) Создаём заказ
         payload = ser.validated_data | {'total_amount': total_amount}
+
         if request.user.is_authenticated:
             order = Order.objects.create(user=request.user, **payload)
         else:
-            # session_key у нас уже гарантирован в get_cart_qs
             order = Order.objects.create(session_key=request.session.session_key, **payload)
 
-        # 5) Переносим строки корзины в позиции заказа
         items = [
             OrderItem(
                 order=order,
@@ -177,38 +208,43 @@ class CheckoutView(APIView):
             for ci in qs
         ]
         OrderItem.objects.bulk_create(items)
-
-        # 6) Чистим корзину
         qs.delete()
 
-        # 7) Ответ
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_201_CREATED)
 
-# Список моих заказов
+
+# ==============================
+# /api/orders — список заказов
+# ==============================
 class MyOrdersView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        """
+        Возвращает список заказов текущего пользователя или сессии.
+        """
         if request.user.is_authenticated:
             orders = Order.objects.filter(user=request.user).order_by('-created_at')
         else:
-            # гарантируем ключ сессии (как и в корзине)
             if not request.session.session_key:
                 request.session.save()
             sk = request.session.session_key
             orders = Order.objects.filter(session_key=sk).order_by('-created_at')
 
-        data = OrderDetailSerializer(orders, many=True).data
-        return Response(data)
+        return Response(OrderDetailSerializer(orders, many=True).data, status=200)
 
-# Детальная карточка заказа
+
+# ==============================
+# /api/orders/{id} — детали заказа
+# ==============================
 class OrderDetailView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request, pk):
+        """
+        Возвращает детали конкретного заказа.
+        """
         qs = Order.objects.all()
-
-        # отдаём только «свои» заказы
         if request.user.is_authenticated:
             qs = qs.filter(user=request.user)
         else:
@@ -221,95 +257,4 @@ class OrderDetailView(APIView):
         except Order.DoesNotExist:
             return Response({'detail': 'Заказ не найден'}, status=404)
 
-        return Response(OrderDetailSerializer(order).data)
-
-
-# orders/views.py
-from django.db.models import Sum, F
-from rest_framework import status, permissions
-from rest_framework.response import Response
-from rest_framework.views import APIView
-
-from catalog.models import Product
-from .models import CartItem
-
-def get_cart_qs(request):
-    if request.user.is_authenticated:
-        return (CartItem.objects
-                .select_related('product', 'user')
-                .filter(user=request.user)
-                .order_by('-update_at'))
-    if not request.session.session_key:
-        request.session.save()
-    sk = request.session.session_key
-    return (CartItem.objects
-            .select_related('product')
-            .filter(session_key=sk)
-            .order_by('-update_at'))
-
-class BasketView(APIView):
-    permission_classes = [permissions.AllowAny]
-
-    def get(self, request):
-        qs = get_cart_qs(request)
-
-        items = []
-        for ci in qs:
-            p = ci.product
-            # соберём картинки в формате swagger: [{src, alt}]
-            imgs = []
-            for img in getattr(p, 'images', []).all() if hasattr(p, 'images') else []:
-                # предполагаю поля image.url и alt (подправь, если у тебя иначе)
-                src = getattr(img, 'image', None)
-                src = src.url if src and hasattr(src, 'url') else ''
-                alt = getattr(img, 'alt', p.title)
-                imgs.append({'src': src, 'alt': alt})
-
-            items.append({
-                # минимальный набор, который фронту точно нужен:
-                'id': int(p.id),
-                'price': float(getattr(ci, 'price_at_add', p.price)),
-                'count': int(ci.qty),
-
-                # полезные поля (фронт их терпит, в swagger они есть):
-                'title': getattr(p, 'title', ''),
-                'images': imgs,
-            })
-
-        return Response(items)
-
-    def post(self, request):
-        # принимает и {product_id, qty}, и {id, count} – как в swagger
-        product_id = request.data.get('product_id') or request.data.get('id')
-        qty_raw = request.data.get('qty', request.data.get('count', 1))
-
-        try:
-            qty = int(qty_raw)
-        except (TypeError, ValueError):
-            return Response({'detail': 'qty/count must be integer'}, status=400)
-        if qty <= 0:
-            return Response({'detail': 'qty must be >= 1'}, status=400)
-
-        try:
-            product = Product.objects.get(id=product_id)
-        except Product.DoesNotExist:
-            return Response({'detail': 'Product not found'}, status=404)
-
-        defaults = {'price_at_add': product.price}
-        if request.user.is_authenticated:
-            item, created = CartItem.objects.get_or_create(
-                user=request.user, product=product, defaults=defaults
-            )
-        else:
-            if not request.session.session_key:
-                request.session.save()
-            sk = request.session.session_key
-            item, created = CartItem.objects.get_or_create(
-                session_key=sk, product=product, defaults=defaults
-            )
-
-        item.qty = (item.qty + qty) if not created else qty
-        item.save()
-
-        # отвечаем кратко – фронт всё равно делает потом GET /basket
-        return Response({'id': item.id}, status=status.HTTP_201_CREATED)
+        return Response(OrderDetailSerializer(order).data, status=200)
