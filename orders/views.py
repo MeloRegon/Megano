@@ -1,7 +1,6 @@
 
-
 # ==============================
-# views.py — финальная версия под Swagger
+# views.py — Final version for Swagger
 # ==============================
 
 import json
@@ -19,11 +18,11 @@ from .serializers import (
 
 
 # ==============================
-# Вспомогательная функция для корзины
+# Helper function for the cart
 # ==============================
 def get_cart_qs(request):
     """
-    Возвращает QuerySet корзины для текущего пользователя или сессии.
+    Returns the cart QuerySet for the current user or session.
     """
     if request.user.is_authenticated:
         return (
@@ -46,17 +45,20 @@ def get_cart_qs(request):
 
 
 # ==============================
-# /api/basket — основная корзина
+# /api/basket — main cart
 # ==============================
 class BasketView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        """
+        Returns all items currently in the basket.
+        """
         items = []
         for ci in get_cart_qs(request):
             p = ci.product
 
-            # --- собираем изображения безопасно ---
+            # Collect images safely
             images = []
             try:
                 for img in p.images.all():
@@ -68,7 +70,7 @@ class BasketView(APIView):
             except Exception:
                     images = []
 
-            # --- безопасно приводим цену и количество ---
+            # Safe price and count conversion
             price = getattr(p, "price", 0)
             try:
                 price = float(price)
@@ -94,7 +96,10 @@ class BasketView(APIView):
 
     # POST /api/basket
     def post(self, request):
-        # фронт шлёт {"id": 123, "count": 2}
+        """
+        Adds a  product to the basket.
+        Expected data: {"id": product_id, "count": quantity}
+        """
         payload = request.data or {}
         pid = payload.get("id")
         cnt = payload.get("count", 1)
@@ -130,12 +135,13 @@ class BasketView(APIView):
         obj.qty = (obj.qty + cnt) if not created else cnt
         obj.save()
 
-        # вернуть обновлённую корзину
         return self.get(request)
 
-    # DELETE /api/basket
     def delete(self, request):
-        # фронт шлёт {"id": 123, "count": 1}
+        """
+        Removes or decreases an item from the basket.
+        Expected data: {"id": product_id, "count": quantity_to_remove}
+        """
         payload = request.data or {}
         pid = payload.get("id")
         dec = payload.get("count", 1)
@@ -159,39 +165,33 @@ class BasketView(APIView):
         else:
             item.delete()
 
-        # вернуть обновлённую корзину
         return self.get(request)
 
 # ==============================
-# /api/checkout — оформление заказа
+# /api/checkout — order creation
 # ==============================
 class CheckoutView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
         """
-        Оформляет заказ из корзины.
+        Creates an order based on the current basket.
         """
         qs = get_cart_qs(request)
+        # for item in qs:
+        #     print(f"Product: {item.product}, Qty: {item.qty}, Price: {item.price_at_add}")
+        # print("DEBUG CART:", qs)
+
         if not qs.exists():
-            return Response({'detail': 'Корзина пуста'}, status=400)
-
-        # Данные из формы (учитываем «кривой» JSON)
-        if len(request.POST.keys()) == 1:
-            try:
-                only_key = next(iter(request.POST.keys()))
-                payload = json.loads(only_key)
-                request.data.update(payload)
-            except Exception:
-                pass
-
-        ser = OrderCreateSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
+            return Response({'detail': 'Your basket is empty'}, status=400)
 
         agg = qs.aggregate(total=Sum(F('qty') * F('price_at_add')))
         total_amount = agg['total'] or 0
 
-        payload = ser.validated_data | {'total_amount': total_amount}
+        ser = OrderCreateSerializer(data={})
+        ser.is_valid(raise_exception=False)
+
+        payload = {'total_amount': total_amount}
 
         if request.user.is_authenticated:
             order = Order.objects.create(user=request.user, **payload)
@@ -208,20 +208,21 @@ class CheckoutView(APIView):
             for ci in qs
         ]
         OrderItem.objects.bulk_create(items)
+
         qs.delete()
 
-        return Response(OrderDetailSerializer(order).data, status=status.HTTP_201_CREATED)
+        return Response({'orderId': order.id}, status=status.HTTP_201_CREATED)
 
 
 # ==============================
-# /api/orders — список заказов
+# /api/orders — orders list
 # ==============================
 class MyOrdersView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
         """
-        Возвращает список заказов текущего пользователя или сессии.
+        Returns all orders for the current user or session
         """
         if request.user.is_authenticated:
             orders = Order.objects.filter(user=request.user).order_by('-created_at')
@@ -233,16 +234,20 @@ class MyOrdersView(APIView):
 
         return Response(OrderDetailSerializer(orders, many=True).data, status=200)
 
+    def post(self, request, *args, **kwargs):
+        checkout_view = CheckoutView()
+        return checkout_view.post(request)
+
 
 # ==============================
-# /api/orders/{id} — детали заказа
+# /api/orders/{id} — order details
 # ==============================
 class OrderDetailView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request, pk):
         """
-        Возвращает детали конкретного заказа.
+        Returns details of a specific order.
         """
         qs = Order.objects.all()
         if request.user.is_authenticated:
@@ -255,6 +260,22 @@ class OrderDetailView(APIView):
         try:
             order = qs.get(pk=pk)
         except Order.DoesNotExist:
-            return Response({'detail': 'Заказ не найден'}, status=404)
+            return Response({'detail': 'Order not found'}, status=404)
 
         return Response(OrderDetailSerializer(order).data, status=200)
+
+    def post(self, request, pk):
+        """
+        Marks the order as paid and returns redirect URL.
+        """
+        try:
+            order = Order.objects.get(pk=pk)
+        except Order.DoesNotExist:
+            return Response({'detail': 'Заказ не найден'}, status=404)
+
+        order.status = 'paid'
+        order.save(update_fields=['status'])
+        return Response({
+            'detail': 'Заказ успешно оплачен',
+            'redirect_url': '/history-order/'
+        }, status=200)
